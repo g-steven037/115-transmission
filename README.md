@@ -1,5 +1,8 @@
 # MoviePilot Plugins
 
+> [!IMPORTANT]
+> 本仓库已迁移至 [g-steven037/MoviePilot-Plugins](https://github.com/g-steven037/MoviePilot-Plugins)。后续插件更新只在新仓库发布，请在 MoviePilot 中替换第三方插件仓库地址。
+
 个人维护的 MoviePilot V2 插件集合，仅用于自用测试。
 
 在 MoviePilot 插件市场的第三方仓库设置中添加：
