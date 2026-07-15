@@ -5,6 +5,7 @@ import queue
 import re
 import stat
 import threading
+import hmac
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
@@ -30,6 +31,7 @@ SAFE_CODES = {
     "PATH_OUTSIDE_ROOT", "LINK_OR_REPARSE_POINT", "NOT_REGULAR_FILE",
     "NOT_A_HARDLINK", "INVALID_FILE", "CIRCUIT_OPEN", "MOVE_FAILED",
     "DELETE_FAILED", "QUEUE_OVERFLOW", "RETRY_EXHAUSTED",
+    "HOURLY_LIMIT", "CONSECUTIVE_FAILURES",
 }
 
 
@@ -59,7 +61,7 @@ class P115RapidRetry(_PluginBase):
     plugin_name = "115秒传重试"
     plugin_desc = "（仅自用）监控目录，秒传失败时转移到临时目录，定时重试，秒传成功后删除本地文件，仅自用测试。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/v2/src/assets/images/misc/u115.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "115-transmission"
     author_url = "https://github.com"
     plugin_config_prefix = "p115rapidretry_"
@@ -75,6 +77,10 @@ class P115RapidRetry(_PluginBase):
     _stable_seconds = 10
     _max_batch = 10
     _max_retries = 10
+    _min_request_interval = 30
+    _hourly_request_limit = 30
+    _consecutive_failure_limit = 5
+    _failure_cooldown_minutes = 60
     _delete_exhausted_enabled = False
     _notify_enabled = False
     _detailed_logs = True
@@ -91,6 +97,12 @@ class P115RapidRetry(_PluginBase):
     _overflow = False
     _auth_blocked = False
     _circuit_until = 0.0
+    _circuit_reason = ""
+    _cookie_tag = ""
+    _request_times: List[float] = []
+    _last_request_at = 0.0
+    _consecutive_failures = 0
+    _risk_notices: set[str] = set()
     _sha1_cache: Dict[FileIdentity, str] = {}
 
     def init_plugin(self, config: dict = None):
@@ -100,6 +112,12 @@ class P115RapidRetry(_PluginBase):
         self._client = None
         self._auth_blocked = False
         self._circuit_until = 0.0
+        self._circuit_reason = ""
+        self._cookie_tag = ""
+        self._request_times = []
+        self._last_request_at = 0.0
+        self._consecutive_failures = 0
+        self._risk_notices = set()
         self._sha1_cache = {}
         if not self._enabled:
             return
@@ -110,6 +128,14 @@ class P115RapidRetry(_PluginBase):
             self._stable_seconds = self._bounded_int(config.get("stable_seconds", 10), 1, 3600)
             self._max_batch = self._bounded_int(config.get("max_batch", 10), 1, 100)
             self._max_retries = self._bounded_int(config.get("max_retries", 10), 1, 100)
+            self._min_request_interval = self._bounded_int(config.get("min_request_interval", 30), 5, 300)
+            self._hourly_request_limit = self._bounded_int(config.get("hourly_request_limit", 30), 1, 120)
+            self._consecutive_failure_limit = self._bounded_int(
+                config.get("consecutive_failure_limit", 5), 2, 20
+            )
+            self._failure_cooldown_minutes = self._bounded_int(
+                config.get("failure_cooldown_minutes", 60), 10, 1440
+            )
             self._delete_exhausted_enabled = bool(config.get("delete_exhausted_enabled", False))
             self._notify_enabled = bool(config.get("notify_enabled", False))
             self._detailed_logs = bool(
@@ -133,6 +159,7 @@ class P115RapidRetry(_PluginBase):
                     cleanup_stat = self._safe_directory_stat(cleanup_root)
                     self._empty_cleanup_identities[cleanup_root] = (cleanup_stat.st_dev, cleanup_stat.st_ino)
             cookie = self._validate_cookie(config.get("cookie", ""))
+            self._load_risk_control(cookie)
             self._client = self._create_client(cookie)
             del cookie
             self._start_realtime_monitor()
@@ -184,6 +211,168 @@ class P115RapidRetry(_PluginBase):
         if not {"UID", "SEID"}.issubset(names):
             raise ValueError("COOKIE_INVALID")
         return cookie
+
+    @staticmethod
+    def _cookie_fingerprint(cookie: str) -> str:
+        secret = str(getattr(settings, "SECRET_KEY", "") or "").strip()
+        if not secret:
+            raise ValueError("SECRET_KEY_UNAVAILABLE")
+        return hmac.new(secret.encode("utf-8"), cookie.encode("utf-8"), sha256).hexdigest()[:32]
+
+    @staticmethod
+    def _safe_timestamp(value: Any, now: float, maximum_future: float = 86400) -> float:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if timestamp != timestamp or timestamp < 0 or timestamp > now + maximum_future:
+            return 0.0
+        return timestamp
+
+    def _load_risk_control(self, cookie: str):
+        now = time()
+        state = self.get_data("risk_control") or {}
+        self._cookie_tag = self._cookie_fingerprint(cookie)
+        stored_tag = str(state.get("cookie_tag", ""))
+        self._auth_blocked = bool(state.get("auth_blocked", False)) and stored_tag == self._cookie_tag
+        self._circuit_until = self._safe_timestamp(state.get("circuit_until", 0), now)
+        self._circuit_reason = str(state.get("circuit_reason", ""))[:64] if self._circuit_until > now else ""
+        if self._circuit_until <= now:
+            self._circuit_until = 0.0
+        request_times = state.get("request_times", [])
+        if not isinstance(request_times, list):
+            request_times = []
+        self._request_times = sorted(
+            timestamp for timestamp in (
+                self._safe_timestamp(value, now, maximum_future=60) for value in request_times[-240:]
+            )
+            if now - 3600 < timestamp <= now + 60
+        )
+        self._last_request_at = self._safe_timestamp(state.get("last_request_at", 0), now, maximum_future=60)
+        try:
+            self._consecutive_failures = min(max(int(state.get("consecutive_failures", 0)), 0), 1000)
+        except (TypeError, ValueError, OverflowError):
+            self._consecutive_failures = 0
+        notices = state.get("notices", [])
+        self._risk_notices = {
+            str(code) for code in notices
+            if str(code) in {"AUTH_FAILED", "RATE_LIMITED", "HOURLY_LIMIT", "CONSECUTIVE_FAILURES"}
+        } if isinstance(notices, list) else set()
+        if self._circuit_until <= now:
+            self._risk_notices.discard(str(state.get("circuit_reason", "")))
+        if stored_tag != self._cookie_tag:
+            self._auth_blocked = False
+            self._risk_notices.discard("AUTH_FAILED")
+        self._save_risk_control()
+        if self._auth_blocked:
+            logger.warning("#115秒传# 已恢复认证熔断；更换有效Cookie后才会解除")
+        elif self._circuit_until > now:
+            logger.warning(
+                f"#115秒传# 已恢复风控暂停 | 代码={self._normalize_code(self._circuit_reason)} | "
+                f"剩余秒数={int(self._circuit_until - now)}"
+            )
+
+    def _save_risk_control(self):
+        self.save_data("risk_control", {
+            "version": 1,
+            "cookie_tag": self._cookie_tag,
+            "auth_blocked": self._auth_blocked,
+            "circuit_until": int(self._circuit_until),
+            "circuit_reason": self._normalize_code(self._circuit_reason) if self._circuit_reason else "",
+            "request_times": [int(value) for value in self._request_times[-240:]],
+            "last_request_at": int(self._last_request_at),
+            "consecutive_failures": self._consecutive_failures,
+            "notices": sorted(self._risk_notices),
+        })
+
+    def _risk_notice_once(self, code: str, title: str, text: str):
+        if not self._notify_enabled or code in self._risk_notices:
+            return
+        self._risk_notices.add(code)
+        self._save_risk_control()
+        self._post_bot(title, text)
+
+    def _open_circuit(self, code: str, seconds: int, title: str, text: str):
+        until = time() + max(int(seconds), 1)
+        if until > self._circuit_until:
+            self._circuit_until = until
+            self._circuit_reason = self._normalize_code(code)
+        self._save_risk_control()
+        self._risk_notice_once(code, title, text)
+
+    def _acquire_request_slot(self) -> bool:
+        now = time()
+        if self._circuit_until and now >= self._circuit_until:
+            self._risk_notices.discard(self._circuit_reason)
+            self._circuit_until = 0.0
+            self._circuit_reason = ""
+            self._save_risk_control()
+        if self._auth_blocked or now < self._circuit_until:
+            return False
+        self._request_times = [value for value in self._request_times if now - 3600 < value <= now + 60]
+        if len(self._request_times) >= self._hourly_request_limit:
+            seconds = max(int(self._request_times[0] + 3600 - now), 60)
+            self._open_circuit(
+                "HOURLY_LIMIT", seconds,
+                "115秒传已触发小时请求保护",
+                f"过去一小时已达到 {self._hourly_request_limit} 次秒传初始化操作，暂停 {seconds} 秒。",
+            )
+            logger.warning(
+                f"#115秒传# 小时请求额度已用尽 | 上限={self._hourly_request_limit} | 暂停秒数={seconds}"
+            )
+            return False
+        delay = self._min_request_interval - (now - self._last_request_at)
+        if delay > 0:
+            if self._detailed_logs:
+                logger.info(f"#115秒传# 风控间隔等待 {int(delay) + 1} 秒")
+            if self._stop_event.wait(delay):
+                return False
+            now = time()
+            if self._auth_blocked or now < self._circuit_until:
+                return False
+            self._request_times = [value for value in self._request_times if now - 3600 < value <= now + 60]
+            if len(self._request_times) >= self._hourly_request_limit:
+                return False
+        self._request_times.append(now)
+        self._last_request_at = now
+        self._save_risk_control()
+        return True
+
+    def _apply_risk_result(self, result: RapidResult):
+        if result.code == "CIRCUIT_OPEN":
+            return
+        if result.code == "AUTH_FAILED":
+            self._auth_blocked = True
+            self._save_risk_control()
+            self._risk_notice_once(
+                "AUTH_FAILED", "115秒传认证已熔断",
+                "检测到115登录失效，已停止所有115请求。请更新有效Cookie后重新启用插件。",
+            )
+            return
+        if result.code == "RATE_LIMITED":
+            self._consecutive_failures = 0
+            self._open_circuit(
+                "RATE_LIMITED", 3600,
+                "115秒传已触发限流保护",
+                "检测到115频率限制，已暂停所有115请求一小时；重启插件不会提前解除。",
+            )
+            return
+        if result.success or result.code == "RAPID_MISS":
+            self._consecutive_failures = 0
+            self._risk_notices.discard("CONSECUTIVE_FAILURES")
+            self._save_risk_control()
+            return
+        if result.code in {"NETWORK_TIMEOUT", "NETWORK_ERROR", "INVALID_RESPONSE", "CLIENT_ERROR", "API_REJECTED"}:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._consecutive_failure_limit:
+                seconds = self._failure_cooldown_minutes * 60
+                self._open_circuit(
+                    "CONSECUTIVE_FAILURES", seconds,
+                    "115秒传连续失败保护已启动",
+                    f"连续 {self._consecutive_failures} 次接口或网络失败，已暂停请求 {self._failure_cooldown_minutes} 分钟。",
+                )
+            else:
+                self._save_risk_control()
 
     @staticmethod
     def _create_client(cookie: str) -> P115Client:
@@ -459,6 +648,7 @@ class P115RapidRetry(_PluginBase):
                 require_hardlink=not from_retry,
                 known_sha1=known_sha1,
                 progress=progress,
+                request_guard=self._acquire_request_slot,
             )
         identity = result.identity or identity
         if identity and result.sha1:
@@ -468,10 +658,7 @@ class P115RapidRetry(_PluginBase):
         self._record(task_id, result.success, result.code)
         self._audit_rapid(path, root, result, from_retry, attempt_no)
 
-        if result.code == "AUTH_FAILED":
-            self._auth_blocked = True
-        elif result.code == "RATE_LIMITED":
-            self._circuit_until = time() + 3600
+        self._apply_risk_result(result)
 
         if result.success:
             if identity and self._verified_unlink(path, identity, root):
@@ -495,6 +682,8 @@ class P115RapidRetry(_PluginBase):
             return
 
         if from_retry:
+            if result.code == "CIRCUIT_OPEN":
+                return
             attempts, exhausted = self._schedule_retry(task_id, result.code)
             if exhausted:
                 self._record(task_id, False, "RETRY_EXHAUSTED")
@@ -866,6 +1055,10 @@ class P115RapidRetry(_PluginBase):
             ("stable_seconds", "文件稳定等待秒数（1-3600）", "number"),
             ("max_batch", "每轮最大重试文件数（1-100）", "number"),
             ("max_retries", "单文件最大重试次数（1-100）", "number"),
+            ("min_request_interval", "115请求最小间隔秒数（5-300）", "number"),
+            ("hourly_request_limit", "每小时最多115请求数（1-120）", "number"),
+            ("consecutive_failure_limit", "连续技术失败熔断次数（2-20）", "number"),
+            ("failure_cooldown_minutes", "连续失败暂停分钟数（10-1440）", "number"),
             ("empty_cleanup_root", "定时清理空文件夹根目录（每行一个绝对路径）", None),
             ("empty_cleanup_cron", "空文件夹清理 Cron（5段）", None),
         ]
@@ -898,6 +1091,8 @@ class P115RapidRetry(_PluginBase):
             "empty_cleanup_enabled": False, "cookie": "",
             "protected_pt_dir": "", "watch_dir": "", "retry_dir": "", "target_pid": "0",
             "cron": "*/10 * * * *", "stable_seconds": 10, "max_batch": 10, "max_retries": 10,
+            "min_request_interval": 30, "hourly_request_limit": 30,
+            "consecutive_failure_limit": 5, "failure_cooldown_minutes": 60,
             "empty_cleanup_root": "", "empty_cleanup_cron": "0 4 * * *",
         }
 

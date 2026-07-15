@@ -121,7 +121,23 @@ def _safe_response_code(response: dict) -> tuple[str, bool]:
 
 
 def _safe_exception_code(exc: Exception) -> str:
+    status_values = []
+    for target in (exc, getattr(exc, "response", None)):
+        if target is None:
+            continue
+        for attribute in ("status_code", "status", "code", "errno"):
+            value = getattr(target, attribute, None)
+            if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+                status_values.append(str(value))
+    if any(value in {"401", "403"} for value in status_values):
+        return "AUTH_FAILED"
+    if any(value in {"405", "429"} for value in status_values):
+        return "RATE_LIMITED"
     name = type(exc).__name__.lower()
+    if any(token in name for token in ("auth", "login", "cookie", "unauthorized", "forbidden")):
+        return "AUTH_FAILED"
+    if any(token in name for token in ("ratelimit", "too_many", "toomany")):
+        return "RATE_LIMITED"
     if "timeout" in name:
         return "NETWORK_TIMEOUT"
     if isinstance(exc, (ConnectionError, OSError)):
@@ -139,6 +155,7 @@ def try_rapid_upload(
     require_hardlink: bool = False,
     known_sha1: str | None = None,
     progress: Callable[[str], None] | None = None,
+    request_guard: Callable[[], bool] | None = None,
 ) -> RapidResult:
     """Only initialize an upload. It never invokes a content-upload API."""
     root = root or path.parent
@@ -162,6 +179,8 @@ def try_rapid_upload(
                 full_sha1 = _sha1_stream(stream)
                 if progress:
                     progress("SHA1_DONE")
+            if request_guard and not request_guard():
+                return RapidResult(False, True, "CIRCUIT_OPEN", identity, full_sha1)
             response = client.upload_file_init(
                 filename=path.name,
                 filesize=identity.size,
