@@ -20,9 +20,6 @@ from app.log import logger
 from app.plugins import _PluginBase
 
 from .rapid import FileIdentity, RapidResult, same_identity, secure_identity, try_rapid_upload
-from .crypto import decrypt_cookie
-
-
 SAFE_CODES = {
     "RAPID_SUCCESS", "RAPID_MISS", "AUTH_FAILED", "RATE_LIMITED",
     "NETWORK_TIMEOUT", "NETWORK_ERROR", "INVALID_RESPONSE", "CLIENT_ERROR",
@@ -59,7 +56,7 @@ class P115RapidRetry(_PluginBase):
     plugin_name = "115秒传重试"
     plugin_desc = "安全监控硬链接目录，未命中秒传时原子移入临时目录并限速重试"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.3.0"
     plugin_author = "115-transmission"
     author_url = "https://github.com"
     plugin_config_prefix = "p115rapidretry_"
@@ -104,11 +101,7 @@ class P115RapidRetry(_PluginBase):
             self._retry_dir = self._prepare_path(config.get("retry_dir"), create=True)
             self._protected_pt_dir = self._prepare_path(config.get("protected_pt_dir"), create=False)
             self._validate_directory_isolation()
-            cookie = decrypt_cookie(
-                str(config.get("cookie_ciphertext", "")).strip(),
-                str(config.get("secret_key_env", "P115RAPIDRETRY_KEY")).strip(),
-                str(config.get("secret_key_file", "")).strip(),
-            )
+            cookie = self._validate_cookie(config.get("cookie", ""))
             self._client = P115Client(cookie, check_for_relogin=False)
             del cookie
             self._start_realtime_monitor()
@@ -129,6 +122,21 @@ class P115RapidRetry(_PluginBase):
         if re.fullmatch(r"\d{1,20}", value) or re.fullmatch(r"[US]_\d{1,20}_\d{1,20}", value):
             return value
         raise ValueError("TARGET_PID_INVALID")
+
+    @staticmethod
+    def _validate_cookie(value: Any) -> str:
+        cookie = str(value or "").strip()
+        if not cookie or len(cookie) > 8192:
+            raise ValueError("COOKIE_INVALID")
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in cookie):
+            raise ValueError("COOKIE_INVALID")
+        parts = [part.strip() for part in cookie.split(";") if part.strip()]
+        if not parts or any("=" not in part or not part.split("=", 1)[0].strip() for part in parts):
+            raise ValueError("COOKIE_INVALID")
+        names = {part.split("=", 1)[0].strip().upper() for part in parts}
+        if not {"UID", "SEID"}.issubset(names):
+            raise ValueError("COOKIE_INVALID")
+        return cookie
 
     @staticmethod
     def _prepare_path(value: Any, create: bool) -> Path:
@@ -436,9 +444,7 @@ class P115RapidRetry(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         fields = [
-            ("cookie_ciphertext", "AES-256-GCM 加密后的115 Cookie", "password"),
-            ("secret_key_file", "主密钥 Secret 文件绝对路径（推荐）", None),
-            ("secret_key_env", "主密钥环境变量名", None),
+            ("cookie", "115 Cookie（明文，密码框隐藏）", "password"),
             ("protected_pt_dir", "受保护的PT下载目录（不扫描）", None),
             ("watch_dir", "硬链接实时监控目录", None),
             ("retry_dir", "失败临时目录", None),
@@ -447,15 +453,17 @@ class P115RapidRetry(_PluginBase):
             ("stable_seconds", "文件稳定等待秒数（1-3600）", "number"),
             ("max_batch", "每轮最大重试文件数（1-100）", "number"),
         ]
-        content = [{"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": "禁止填写明文 Cookie。密文使用随插件提供的交互式工具生成，主密钥必须通过 Docker Secret 或环境变量注入。"}}]}]}]
+        content = [{"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": "Cookie 仅用于登录115官方接口，不发送给其他第三方，不写入插件日志或历史；MoviePilot 会将其保存在自身配置中，请保护管理端和数据目录。"}}]}]}]
         content.append({"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用严格安全模式"}}]}]})
         for model, label, field_type in fields:
             props = {"model": model, "label": label, "clearable": False}
             if field_type:
                 props["type"] = field_type
+            if model == "cookie":
+                props["autocomplete"] = "new-password"
             content.append({"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextField", "props": props}]}]})
         return [{"component": "VForm", "content": content}], {
-            "enabled": False, "cookie_ciphertext": "", "secret_key_file": "", "secret_key_env": "P115RAPIDRETRY_KEY",
+            "enabled": False, "cookie": "",
             "protected_pt_dir": "", "watch_dir": "", "retry_dir": "", "target_pid": "0",
             "cron": "*/10 * * * *", "stable_seconds": 10, "max_batch": 10,
         }

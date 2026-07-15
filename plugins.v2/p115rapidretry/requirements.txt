@@ -1,3 +1,2 @@
 p115client==0.0.9.3.11
 watchdog==6.0.0
-cryptography==49.0.0

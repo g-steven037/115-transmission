@@ -13,32 +13,9 @@
 7. 认证失败立即熔断；限流响应全局暂停一小时。
 8. 历史只保存匿名任务 ID 和内部安全码，不保存路径、文件名、Cookie、响应体或原始异常。
 
-## 加密 Cookie
+## Cookie 安全边界
 
-插件拒绝明文 Cookie。配置中只保存 AES-256-GCM 密文，32 字节主密钥必须由只读 Docker Secret 文件（推荐）或环境变量注入，不能写入 MoviePilot 数据库或仓库。
-
-在可信终端执行交互式工具（Cookie 输入不会回显，也不会进入命令行历史）：
-
-```bash
-python tools/encrypt_cookie.py
-```
-
-工具会要求一个不存在的绝对路径，并以仅所有者可读写权限创建主密钥文件。它不会把主密钥打印到终端。输出内容只有：
-
-- Secret 文件路径：挂载到 MoviePilot 容器并填入“主密钥 Secret 文件绝对路径”。
-- `v1.` 开头的密文：填入“加密后的115 Cookie”。
-
-Docker Compose Secret 示例：
-
-```yaml
-services:
-  moviepilot:
-    secrets:
-      - p115rapidretry_key
-secrets:
-  p115rapidretry_key:
-    file: /宿主机/安全目录/p115rapidretry.key
-```
+配置页使用密码框直接填写115 Cookie。插件只把 Cookie 交给115客户端用于访问115官方接口，不发送给其他第三方，不写入插件日志、历史记录或任务数据。MoviePilot 仍需将明文 Cookie 保存到自身配置数据库，浏览器提交配置时也会把它传给 MoviePilot 服务端；请启用 HTTPS、限制管理端访问并保护 MoviePilot 数据目录。
 
 ## 目录要求
 
@@ -49,9 +26,7 @@ secrets:
 
 ## 配置
 
-- `AES-256-GCM 加密后的115 Cookie`：仅接受 `v1.` 密文。
-- `主密钥 Secret 文件绝对路径`：推荐 `/run/secrets/p115rapidretry_key`。
-- `主密钥环境变量名`：未使用 Secret 文件时默认读取 `P115RAPIDRETRY_KEY`。
+- `115 Cookie`：直接填写，输入框以密码形式隐藏；必须包含 `UID` 和 `SEID`。
 - `受保护的PT下载目录`：只校验，不扫描。
 - `硬链接实时监控目录`：实时事件来源。
 - `失败临时目录`：失败文件的原子移动目标。
