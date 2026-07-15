@@ -1,3 +1,19 @@
+# MoviePilot Plugins
+
+个人维护的 MoviePilot V2 插件集合，仅用于自用测试。
+
+在 MoviePilot 插件市场的第三方仓库设置中添加：
+
+```text
+https://github.com/g-steven037/MoviePilot-Plugins
+```
+
+当前包含：
+
+- `P115RapidRetry`：监控硬链接目录，115秒传未命中时转移到临时目录并按 Cron 重试；秒传成功后安全删除对应本地硬链接。
+
+---
+
 # MoviePilot 115 秒传重试（仅自用）
 
 适用于 MoviePilot V2.14.2。插件只调用 115 上传初始化接口判断秒传，不包含完整上传代码。
