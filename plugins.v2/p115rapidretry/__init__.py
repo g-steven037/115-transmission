@@ -56,7 +56,7 @@ class P115RapidRetry(_PluginBase):
     plugin_name = "115秒传重试"
     plugin_desc = "安全监控硬链接目录，未命中秒传时原子移入临时目录并限速重试"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
     plugin_author = "115-transmission"
     author_url = "https://github.com"
     plugin_config_prefix = "p115rapidretry_"
@@ -102,7 +102,7 @@ class P115RapidRetry(_PluginBase):
             self._protected_pt_dir = self._prepare_path(config.get("protected_pt_dir"), create=False)
             self._validate_directory_isolation()
             cookie = self._validate_cookie(config.get("cookie", ""))
-            self._client = P115Client(cookie, check_for_relogin=False)
+            self._client = self._create_client(cookie)
             del cookie
             self._start_realtime_monitor()
         except Exception as exc:
@@ -137,6 +137,11 @@ class P115RapidRetry(_PluginBase):
         if not {"UID", "SEID"}.issubset(names):
             raise ValueError("COOKIE_INVALID")
         return cookie
+
+    @staticmethod
+    def _create_client(cookie: str) -> P115Client:
+        # p115client >= 0.0.9 removed the legacy check_for_relogin argument.
+        return P115Client(cookie)
 
     @staticmethod
     def _prepare_path(value: Any, create: bool) -> Path:
