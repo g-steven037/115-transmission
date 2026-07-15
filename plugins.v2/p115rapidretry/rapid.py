@@ -137,6 +137,8 @@ def try_rapid_upload(
     pid: int | str,
     root: Path | None = None,
     require_hardlink: bool = False,
+    known_sha1: str | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> RapidResult:
     """Only initialize an upload. It never invokes a content-upload API."""
     root = root or path.parent
@@ -150,7 +152,16 @@ def try_rapid_upload(
             opened_identity = FileIdentity.from_stat(os.fstat(stream.fileno()))
             if opened_identity != identity:
                 return RapidResult(False, True, "FILE_CHANGED")
-            full_sha1 = _sha1_stream(stream)
+            if known_sha1 and len(known_sha1) == 40 and all(char in "0123456789abcdefABCDEF" for char in known_sha1):
+                full_sha1 = known_sha1.upper()
+                if progress:
+                    progress("SHA1_CACHE")
+            else:
+                if progress:
+                    progress("SHA1_START")
+                full_sha1 = _sha1_stream(stream)
+                if progress:
+                    progress("SHA1_DONE")
             response = client.upload_file_init(
                 filename=path.name,
                 filesize=identity.size,
