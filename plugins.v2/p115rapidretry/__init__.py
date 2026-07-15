@@ -56,8 +56,8 @@ class _WatchHandler(FileSystemEventHandler):
 
 
 class P115RapidRetry(_PluginBase):
-    plugin_name = "115秒传重试"
-    plugin_desc = "（仅自用）监控目录，秒传失败时转移到临时目录，定时重试，秒传成功后删除本地文件，仅自用测试。"
+    plugin_name = "115秒传重试（仅自用）"
+    plugin_desc = "监控目录，秒传失败时转移到临时目录，定时重试，秒传成功后删除本地文件，仅自用测试。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/v2/src/assets/images/misc/u115.png"
     plugin_version = "1.0.0"
     plugin_author = "115-transmission"
@@ -75,6 +75,7 @@ class P115RapidRetry(_PluginBase):
     _stable_seconds = 10
     _max_batch = 10
     _max_retries = 10
+    _delete_exhausted_enabled = False
     _notify_enabled = False
     _detailed_logs = True
     _empty_cleanup_enabled = False
@@ -109,6 +110,7 @@ class P115RapidRetry(_PluginBase):
             self._stable_seconds = self._bounded_int(config.get("stable_seconds", 10), 1, 3600)
             self._max_batch = self._bounded_int(config.get("max_batch", 10), 1, 100)
             self._max_retries = self._bounded_int(config.get("max_retries", 10), 1, 100)
+            self._delete_exhausted_enabled = bool(config.get("delete_exhausted_enabled", False))
             self._notify_enabled = bool(config.get("notify_enabled", False))
             self._detailed_logs = bool(
                 config.get("detailed_logs", str(config.get("log_mode", "detailed")).strip().lower() == "detailed")
@@ -349,15 +351,27 @@ class P115RapidRetry(_PluginBase):
                 path for path in files
                 if not bool(state.get(self._task_id(path, self._retry_dir), {}).get("exhausted", False))
             ]
+            exhausted_cleanup = [
+                path for path in files
+                if self._delete_exhausted_enabled
+                and bool(state.get(self._task_id(path, self._retry_dir), {}).get("exhausted", False))
+            ]
             if self._detailed_logs:
+                submitted = min(len(eligible) + len(exhausted_cleanup), self._max_batch)
                 logger.info(
-                    f"#115秒传# 临时目录扫描完成，共发现 {len(files)} 个文件，本轮提交 {min(len(eligible), self._max_batch)} 个重试任务"
+                    f"#115秒传# 临时目录扫描完成，共发现 {len(files)} 个文件，本轮提交 {submitted} 个任务"
+                    f"（可重试={len(eligible)}，耗尽清理={len(exhausted_cleanup)}）"
                 )
             processed = 0
             for path in files:
                 task_id = self._task_id(path, self._retry_dir)
                 task_state = state.get(task_id, {})
                 if bool(task_state.get("exhausted", False)):
+                    if self._delete_exhausted_enabled:
+                        self._delete_previously_exhausted(path, task_id, task_state)
+                        processed += 1
+                        if processed >= self._max_batch:
+                            break
                     continue
                 self._handle(path, self._retry_dir, None, from_retry=True)
                 processed += 1
@@ -365,6 +379,37 @@ class P115RapidRetry(_PluginBase):
                     break
         finally:
             self._operation_lock.release()
+
+    def _delete_previously_exhausted(self, path: Path, task_id: str, task_state: Dict[str, Any]) -> bool:
+        filename = self._safe_log_value(path.name)
+        attempts = min(max(int(task_state.get("attempts", self._max_retries)), 0), 1000)
+        code = self._normalize_code(str(task_state.get("code", "RAPID_MISS")))
+        try:
+            identity = secure_identity(path, self._retry_dir, require_hardlink=False)
+        except (OSError, ValueError):
+            logger.warning(
+                f"#115秒传# [简短] 重试耗尽清理=安全校验失败 | 文件={filename} | "
+                f"重试次数={attempts}/{self._max_retries}"
+            )
+            return False
+        if not self._verified_unlink(path, identity, self._retry_dir):
+            logger.warning(
+                f"#115秒传# [简短] 重试耗尽清理=删除失败 | 文件={filename} | "
+                f"重试次数={attempts}/{self._max_retries}"
+            )
+            return False
+        self._clear_retry_state(task_id)
+        self._sha1_cache.pop(identity, None)
+        if self._detailed_logs:
+            logger.warning(f"#115秒传# 已安全删除此前重试耗尽的失败文件: {filename}")
+        else:
+            logger.warning(
+                f"#115秒传# [简短] 重试耗尽清理=已删除 | 文件={filename} | "
+                f"重试次数={attempts}/{self._max_retries}"
+            )
+        self._remove_empty_parent_dirs(path.parent, self._retry_dir)
+        self._send_bot_exhausted(path, attempts, code, deleted=True, delete_requested=True)
+        return True
 
     @staticmethod
     def _secure_files(root: Path):
@@ -453,11 +498,34 @@ class P115RapidRetry(_PluginBase):
             attempts, exhausted = self._schedule_retry(task_id, result.code)
             if exhausted:
                 self._record(task_id, False, "RETRY_EXHAUSTED")
-                logger.warning(
-                    f"#115秒传# {'已达到最大重试次数' if self._detailed_logs else '[简短] 重试已达上限'}"
-                    f"({attempts}/{self._max_retries})，停止自动重试并保留文件: {filename}"
+                deleted = False
+                if self._delete_exhausted_enabled and identity:
+                    deleted = self._verified_unlink(path, identity, root)
+                if deleted:
+                    self._clear_retry_state(task_id)
+                    self._sha1_cache.pop(identity, None)
+                    if self._detailed_logs:
+                        logger.warning(
+                            f"#115秒传# 已达到最大重试次数({attempts}/{self._max_retries})，"
+                            f"已安全删除失败文件: {filename}"
+                        )
+                    else:
+                        logger.warning(
+                            f"#115秒传# [简短] 重试耗尽清理=已删除 | 文件={filename} | "
+                            f"重试次数={attempts}/{self._max_retries}"
+                        )
+                    self._remove_empty_parent_dirs(path.parent, root)
+                else:
+                    cleanup_state = "安全校验失败，文件已保留" if self._delete_exhausted_enabled else "文件已保留"
+                    logger.warning(
+                        f"#115秒传# {'已达到最大重试次数' if self._detailed_logs else '[简短] 重试已达上限'}"
+                        f"({attempts}/{self._max_retries})，停止自动重试，{cleanup_state}: {filename}"
+                    )
+                self._send_bot_exhausted(
+                    path, attempts, result.code,
+                    deleted=deleted,
+                    delete_requested=self._delete_exhausted_enabled,
                 )
-                self._send_bot_exhausted(path, attempts, result.code)
             return
         if not result.retryable or not identity or not same_identity(path, identity, root):
             return
@@ -571,12 +639,26 @@ class P115RapidRetry(_PluginBase):
             f"本地清理：{'已安全删除对应文件' if cleanup_success else '文件身份变化，未删除，请人工检查'}",
         )
 
-    def _send_bot_exhausted(self, path: Path, attempts: int, code: str):
+    def _send_bot_exhausted(
+        self,
+        path: Path,
+        attempts: int,
+        code: str,
+        deleted: bool = False,
+        delete_requested: bool = False,
+    ):
         if not self._notify_enabled:
             return
+        if deleted:
+            cleanup_text = "失败文件已安全删除；空父文件夹已按安全规则清理。"
+        elif delete_requested:
+            cleanup_text = "已启用耗尽删除，但安全校验或删除失败，文件已保留在临时目录。"
+        else:
+            cleanup_text = "文件已保留在临时目录。"
         self._post_bot(
             "115秒传重试已停止",
-            f"文件：{self._safe_log_value(path.name, 500)}\n重试次数：{attempts}\n状态：{self._normalize_code(code)}\n文件已保留在临时目录。",
+            f"文件：{self._safe_log_value(path.name, 500)}\n重试次数：{attempts}\n"
+            f"状态：{self._normalize_code(code)}\n{cleanup_text}",
         )
 
     def _post_bot(self, title: str, text: str):
@@ -793,6 +875,7 @@ class P115RapidRetry(_PluginBase):
             {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "notify_enabled", "label": "Bot通知"}}]},
             {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "detailed_logs", "label": "详细日志"}}]},
             {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "empty_cleanup_enabled", "label": "定时清理空文件夹"}}]},
+            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_exhausted_enabled", "label": "重试耗尽后删除文件及空文件夹"}}]},
         ]})
         for model, label, field_type in fields:
             props = {"model": model, "label": label, "clearable": False}
@@ -811,6 +894,7 @@ class P115RapidRetry(_PluginBase):
             content.append({"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{"component": component, "props": props}]}]})
         return [{"component": "VForm", "content": content}], {
             "enabled": False, "notify_enabled": False, "detailed_logs": True,
+            "delete_exhausted_enabled": False,
             "empty_cleanup_enabled": False, "cookie": "",
             "protected_pt_dir": "", "watch_dir": "", "retry_dir": "", "target_pid": "0",
             "cron": "*/10 * * * *", "stable_seconds": 10, "max_batch": 10, "max_retries": 10,
